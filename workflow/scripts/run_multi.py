@@ -129,6 +129,11 @@ def slurm_jobname_prefix(label: str) -> str:
     return f"pw-{safe}"[:50]
 
 
+def _safe_filename(name: str) -> str:
+    """Sanitise a label name for use as (part of) a log filename."""
+    return re.sub(r"[^A-Za-z0-9_-]", "-", name)
+
+
 def _test_email(cfg: dict) -> int:
     """Send one test notification and report the outcome. Returns an exit code.
 
@@ -184,6 +189,67 @@ def _test_email(cfg: dict) -> int:
         file=sys.stderr,
     )
     return 1
+
+
+def _relate_cmd(
+    rel: dict,
+    *,
+    work_dir: str,
+    image_store: str,
+    workflow_dir: Path,
+    relate_partition: str,
+    relate_mem: str,
+    relate_cpus: int,
+    relate_time: int,
+    relate_qos: str | None,
+) -> list[str]:
+    """Build one ``srun`` invocation of ``relate.py`` for a single relation pair.
+
+    One job per pair, not one job for the whole ``relations:`` list: a
+    single shared ``srun`` time budget lets a slow pair (e.g. one needing a
+    chunk-layout rechunk first) starve the others out of a fixed
+    ``--relate-time``, and a kill that way loses everything not yet written
+    even though earlier pairs already finished. Separate jobs also run
+    concurrently instead of one after another, and ``relate.py`` itself
+    skips a pair whose workbook is already up to date, so retrying with the
+    same relations only redoes what actually failed.
+    """
+    a_name, b_name = rel["a"], rel["b"]
+    cmd = [
+        "srun",
+        "--partition",
+        relate_partition,
+    ]
+    if relate_qos:
+        cmd += ["--qos", relate_qos]
+    cmd += [
+        "--mem",
+        relate_mem,
+        "--cpus-per-task",
+        str(relate_cpus),
+        "--time",
+        str(relate_time),
+        "--job-name",
+        slurm_jobname_prefix(f"relate-{a_name}-to-{b_name}"),
+        sys.executable,
+        str(workflow_dir / "scripts" / "relate.py"),
+        "--work-dir",
+        work_dir,
+        "--image-store",
+        image_store,
+        "--relations",
+        json.dumps([rel]),
+        # Concurrent per-pair jobs sharing the default <work_dir>/logs/
+        # relate.log would interleave -- give each pair its own file.
+        "--log",
+        str(
+            Path(work_dir)
+            / "logs"
+            / "relate"
+            / f"{_safe_filename(a_name)}_to_{_safe_filename(b_name)}.log"
+        ),
+    ]
+    return cmd
 
 
 def _run(cmd: list[str], workflow_dir: Path) -> int:
@@ -448,7 +514,22 @@ def main() -> None:
         "--relate-time",
         type=int,
         default=180,
-        help="srun --time in minutes for the relate step under --profile (default: 180)",
+        help=(
+            "srun --time in minutes for the relate step under --profile "
+            "(default: 180). Each relation pair is its own SLURM job, so "
+            "this bounds one relation, not the whole relations: list."
+        ),
+    )
+    parser.add_argument(
+        "--relate-qos",
+        default=None,
+        help=(
+            "srun --qos for the relate step under --profile. Omit to let "
+            "SLURM pick your account's default QOS for the partition -- set "
+            "this explicitly if that default's MaxWall is shorter than "
+            "--relate-time (sacctmgr -p show assoc/qos shows what's "
+            "available, e.g. '1day', '1week')."
+        ),
     )
     args = parser.parse_args()
 
@@ -603,38 +684,52 @@ def main() -> None:
         # Real CPU/IO work -- tens of thousands of zarr chunk reads for a
         # full-resolution label volume -- not orchestration, so (like the
         # occupancy map) it does not belong in this driver process on the
-        # login node. Submit it as its own job instead.
-        cmd = [
-            "srun",
-            "--partition",
-            args.relate_partition,
-            "--mem",
-            args.relate_mem,
-            "--cpus-per-task",
-            str(args.relate_cpus),
-            "--time",
-            str(args.relate_time),
-            "--job-name",
-            "pw-relate",
-            sys.executable,
-            str(workflow_dir / "scripts" / "relate.py"),
-            "--work-dir",
-            work_dir,
-            "--image-store",
-            image_store,
-            "--relations",
-            json.dumps(relations),
-        ]
-        rc = _run(cmd, workflow_dir)
-        if rc != 0:
+        # login node. Submit it as its own job.
+        #
+        # One job *per relation pair*, not one job for the whole list: a
+        # single shared srun budget lets a slow pair (e.g. one needing a
+        # chunk-layout rechunk first) starve the others' time out of a fixed
+        # --relate-time, and killed that way loses everything not yet
+        # written even though earlier pairs already finished. Separate jobs
+        # also run concurrently rather than one after another, and
+        # relate.py itself now skips a pair whose workbook is already
+        # up to date, so retrying this exact command only redoes what
+        # actually failed.
+        procs = []
+        for rel in relations:
+            cmd = _relate_cmd(
+                rel,
+                work_dir=work_dir,
+                image_store=image_store,
+                workflow_dir=workflow_dir,
+                relate_partition=args.relate_partition,
+                relate_mem=args.relate_mem,
+                relate_cpus=args.relate_cpus,
+                relate_time=args.relate_time,
+                relate_qos=args.relate_qos,
+            )
+            print(f"[run_multi] $ {' '.join(cmd)}", flush=True)
+            procs.append(
+                (
+                    f"{rel['a']} -> {rel['b']}",
+                    subprocess.Popen(cmd, cwd=workflow_dir),
+                )
+            )
+
+        failed = [name for name, p in procs if p.wait() != 0]
+        for name, p in procs:
+            status = "FAILED" if p.returncode else "ok"
+            print(f"[run_multi] relate {name}: {status}", flush=True)
+        if failed:
             print(
-                f"[run_multi] ERROR: relate step failed (exit {rc}). "
-                "Segmentations already succeeded -- only the relation "
-                "workbook(s) are missing. Re-run with the same --config to "
-                "retry just this step.",
+                f"[run_multi] ERROR: {len(failed)} relation(s) failed: "
+                f"{', '.join(failed)}. Segmentations already succeeded, and "
+                "any relation that did finish is written -- re-run with the "
+                "same --config to retry just the ones still missing (already "
+                "up-to-date workbooks are skipped, not recomputed).",
                 file=sys.stderr,
             )
-            sys.exit(rc)
+            sys.exit(1)
         return
 
     from relate import run_relations

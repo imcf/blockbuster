@@ -444,10 +444,14 @@ results/image.zarr/labels/cyto_labels/
 
 !!! tip "The relate step's log"
     Unlike `prepare`/`segment`/`merge`, the relate step isn't a Snakemake
-    rule, so it doesn't get a `log:` directive for free. It writes its own
-    log to `<work_dir>/logs/relate.log` (override with `relate.py --log`),
-    the same tee-to-file-and-stdout behaviour as the other steps — check
-    there instead of scrolling back through `srun`'s live output.
+    rule, so it doesn't get a `log:` directive for free. Standalone (or
+    under plain `multi`), it writes to `<work_dir>/logs/relate.log`
+    (override with `relate.py --log`), the same tee-to-file-and-stdout
+    behaviour as the other steps. Under `multi-slurm`, where each pair is
+    its own concurrent job, `run_multi.py` points each one at its own file
+    instead — `<work_dir>/logs/relate/<a>_to_<b>.log` — so concurrent pairs
+    don't interleave into one log; check there instead of scrolling back
+    through `srun`'s live output.
 
 See [Relating labels across segmentations](label_relations.md) for what
 `label_relations()` returns and how to save it yourself — the cluster
@@ -498,15 +502,29 @@ abort the others; you get a per-config status and a non-zero exit.
 
 !!! tip "The relate step runs on the cluster too, under `multi-slurm`"
     `label_relations()` streams every chunk of two full-resolution label
-    volumes — real CPU/IO work, not orchestration. Under `multi-slurm` it is
-    submitted as its own `srun` job (`scripts/relate.py`) instead of running
-    in the driver process on the login node, the same fix already applied to
-    the occupancy map. Tune its allocation with `--relate-partition`,
-    `--relate-mem`, `--relate-cpus` and `--relate-time` (defaults: `scicore`,
-    `32G`, `8`, `180` minutes) — these are wide-margin guesses, not measured
-    numbers, so raise them for a very large or very object-dense pair. Under
-    plain `multi` (no `--profile`), it still runs locally, in-process, as
-    before.
+    volumes — real CPU/IO work, not orchestration. Under `multi-slurm`,
+    **each pair in `relations:` is submitted as its own `srun` job**
+    (`scripts/relate.py`) instead of running in the driver process on the
+    login node, the same fix already applied to the occupancy map. Tune the
+    allocation with `--relate-partition`, `--relate-mem`, `--relate-cpus`
+    and `--relate-time` (defaults: `scicore`, `32G`, `8`, `180` minutes,
+    **per relation**) — these are wide-margin guesses, not measured numbers,
+    so raise them for a very large or very object-dense pair; a pair needing
+    a chunk-layout rechunk first (see below) is the usual reason one runs
+    long. Set `--relate-qos` if your account's default QOS for the partition
+    caps the wall time below `--relate-time` — `srun` fails immediately with
+    `QOSMaxWallDurationPerJobLimit` when that happens; `sacctmgr -p show
+    assoc user=$USER` and `sacctmgr -p show qos` list what's available and
+    each one's `MaxWall`. Under plain `multi` (no `--profile`), relations
+    still run locally, in-process, one after another, as before.
+
+    Because every pair gets its own job, one running long no longer starves
+    the others out of a shared time budget, and a pair that gets killed no
+    longer takes an already-finished sibling's workbook down with it.
+    `relate.py` also skips a pair whose `.xlsx` is already newer than both
+    labels' merge marker, so **re-running the exact same `multi-slurm`
+    command only recomputes what's still missing or stale** — delete a
+    specific `.xlsx` yourself to force just that one to recompute.
 
 !!! tip "After a killed run"
     Snakemake only releases its lock on a clean exit, so a run that was killed
