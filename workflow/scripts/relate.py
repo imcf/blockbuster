@@ -54,10 +54,42 @@ def _label_ids(image_store: str, name: str) -> list[int]:
     return sorted(int(x) for x in da.unique(arr[arr > 0]).compute())
 
 
+def _relation_up_to_date(
+    work_dir: str, a_name: str, b_name: str, out_path: Path
+) -> bool:
+    """Whether *out_path* already reflects the current *a_name*/*b_name* labels.
+
+    Mirrors the workflow's existing "delete to force" convention (see
+    ``image.zarr`` not being reconverted once it exists): a relation is
+    considered current when its workbook is newer than both labels'
+    ``labels.done`` merge marker, and stale (or never computed) otherwise.
+    Missing markers -- a label group written before merge started recording
+    one, or a nonstandard ``image_store`` layout -- are treated as "unknown,
+    recompute" rather than raise, since staleness can't be judged without them.
+    """
+    if not out_path.exists():
+        return False
+    try:
+        out_mtime = out_path.stat().st_mtime
+        for name in (a_name, b_name):
+            marker = Path(work_dir) / name / "labels.done"
+            if not marker.exists() or marker.stat().st_mtime > out_mtime:
+                return False
+    except OSError:
+        return False
+    return True
+
+
 def run_relations(
     work_dir: str, image_store: str, relations: list[dict]
 ) -> None:
     """Compute and write every configured relation pair as an .xlsx workbook.
+
+    A relation already reflected by an up-to-date workbook (see
+    :func:`_relation_up_to_date`) is skipped rather than recomputed -- so
+    retrying a partially-failed run (this step has no Snakemake rule of its
+    own to track that for it) only redoes what's actually missing or stale.
+    Delete the ``.xlsx`` yourself to force a specific relation to recompute.
 
     Parameters
     ----------
@@ -81,6 +113,13 @@ def run_relations(
         out_path = Path(work_dir) / rel.get(
             "output", f"{a_name}_to_{b_name}.xlsx"
         )
+        if _relation_up_to_date(work_dir, a_name, b_name, out_path):
+            print(
+                f"[relate] {out_path} is already up to date with "
+                f"{a_name}/{b_name}; skipping",
+                flush=True,
+            )
+            continue
         print(f"[relate] relating {a_name} -> {b_name} …", flush=True)
         a = da.from_zarr(image_store, component=f"labels/{a_name}/0")
         b = da.from_zarr(image_store, component=f"labels/{b_name}/0")

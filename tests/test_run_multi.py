@@ -1,7 +1,10 @@
 """Tests for the multi-config driver's SLURM-facing behaviour."""
 
+import json
+import os
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(
@@ -15,6 +18,7 @@ import yaml  # noqa: E402
 
 from run_multi import (  # noqa: E402
     _CONVERT_KEYS,
+    _relate_cmd,
     _snakemake_cmd,
     _validate_configs,
     slurm_jobname_prefix,
@@ -176,6 +180,85 @@ def test_relate_is_submitted_via_slurm_under_profile():
     assert "label_relations(" not in src
 
 
+def _relate_kwargs(**overrides):
+    kwargs = dict(
+        work_dir="/w",
+        image_store="/w/image.zarr",
+        workflow_dir=Path("/workflow"),
+        relate_partition="scicore",
+        relate_mem="32G",
+        relate_cpus=8,
+        relate_time=180,
+        relate_qos=None,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_relate_cmd_is_one_job_per_relation_pair():
+    """A killed shared job used to lose every relation still queued behind
+
+    the one that was running -- one srun per pair means a slow or failing
+    pair can no longer starve, or take down, its siblings' time budget.
+    """
+    relations = [
+        {"a": "nuclei_labels", "b": "cyto_labels", "output": "n2c.xlsx"},
+        {"a": "cilia_labels", "b": "cyto_labels", "output": "c2c.xlsx"},
+    ]
+    cmds = [_relate_cmd(rel, **_relate_kwargs()) for rel in relations]
+
+    assert len(cmds) == 2
+    for cmd, rel in zip(cmds, relations):
+        assert cmd[0] == "srun"
+        assert "--relations" in cmd
+        # Each job's payload is *only* its own pair, not the whole list.
+        payload = json.loads(cmd[cmd.index("--relations") + 1])
+        assert payload == [rel]
+
+
+def test_relate_cmd_job_name_identifies_the_pair():
+    cmd = _relate_cmd(
+        {"a": "cilia_labels", "b": "cyto_labels"}, **_relate_kwargs()
+    )
+    name = cmd[cmd.index("--job-name") + 1]
+    assert _EXECUTOR_RULE.match(name)
+    assert "cilia_labels" in name
+    assert "cyto_labels" in name
+
+
+def test_relate_cmd_gives_each_pair_its_own_log():
+    """Concurrent per-pair jobs sharing one relate.log would interleave --
+
+    each pair's --log must be a distinct file, or the whole point of
+    splitting the log the way segment/<batch>.log already does is lost.
+    """
+    cmds = [
+        _relate_cmd(rel, **_relate_kwargs())
+        for rel in (
+            {"a": "nuclei_labels", "b": "cyto_labels"},
+            {"a": "cilia_labels", "b": "cyto_labels"},
+        )
+    ]
+    logs = [cmd[cmd.index("--log") + 1] for cmd in cmds]
+    assert len(set(logs)) == 2
+    assert all(log.startswith("/w/logs/relate/") for log in logs)
+
+
+def test_relate_cmd_omits_qos_by_default():
+    cmd = _relate_cmd({"a": "a", "b": "b"}, **_relate_kwargs())
+    assert "--qos" not in cmd
+
+
+def test_relate_cmd_passes_qos_when_set():
+    """A default QOS whose MaxWall is shorter than --relate-time is exactly
+
+    what killed a real run (QOSMaxWallDurationPerJobLimit) -- --relate-qos
+    lets a longer one be requested explicitly instead of guessed at.
+    """
+    cmd = _relate_cmd({"a": "a", "b": "b"}, **_relate_kwargs(relate_qos="1day"))
+    assert cmd[cmd.index("--qos") + 1] == "1day"
+
+
 def test_relate_script_has_the_real_bookkeeping():
     """relate.py must be the actual implementation, not a stub.
 
@@ -283,6 +366,88 @@ def test_relate_rechunks_mismatched_label_arrays(tmp_path):
     }
     assert rows[1] == (10, 5, 1.0)  # label 1 fully inside b's label 10
     assert rows[2] == (None, 0, 0)  # label 2 touches nothing in b
+
+
+def test_relation_up_to_date_missing_output_is_false(tmp_path):
+    from relate import _relation_up_to_date
+
+    assert not _relation_up_to_date(
+        str(tmp_path), "a", "b", tmp_path / "nope.xlsx"
+    )
+
+
+def test_relation_up_to_date_missing_marker_is_false(tmp_path):
+    """No labels.done for a label means its state can't be judged -- treat
+
+    that as "recompute", not as "trust the existing workbook".
+    """
+    from relate import _relation_up_to_date
+
+    out = tmp_path / "rel.xlsx"
+    out.write_text("x")
+    assert not _relation_up_to_date(str(tmp_path), "a", "b", out)
+
+
+def test_relation_up_to_date_true_only_when_newer_than_both_markers(
+    tmp_path,
+):
+    from relate import _relation_up_to_date
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "labels.done").touch()
+    (tmp_path / "b" / "labels.done").touch()
+    out = tmp_path / "rel.xlsx"
+    out.write_text("x")
+
+    now = time.time()
+    os.utime(tmp_path / "a" / "labels.done", (now, now))
+    os.utime(tmp_path / "b" / "labels.done", (now, now))
+
+    # older than both markers -> stale
+    os.utime(out, (now - 10, now - 10))
+    assert not _relation_up_to_date(str(tmp_path), "a", "b", out)
+
+    # newer than both markers -> up to date
+    os.utime(out, (now + 10, now + 10))
+    assert _relation_up_to_date(str(tmp_path), "a", "b", out)
+
+    # b re-merged after the workbook was written -> stale again
+    os.utime(tmp_path / "b" / "labels.done", (now + 20, now + 20))
+    assert not _relation_up_to_date(str(tmp_path), "a", "b", out)
+
+
+def test_relate_skips_a_relation_whose_workbook_is_up_to_date(tmp_path):
+    """A retry must not recompute what already finished -- only what a
+
+    shared, now-split-per-pair job left missing after a partial failure.
+    Proven by planting sentinel content no real relation would produce: if
+    run_relations() recomputed anyway, the sentinel would be gone.
+    """
+    from relate import run_relations
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    for name in ("a_labels", "b_labels"):
+        (work_dir / name).mkdir()
+        (work_dir / name / "labels.done").touch()
+
+    out_path = work_dir / "rel.xlsx"
+    sentinel = openpyxl.Workbook()
+    sentinel.active.append(["sentinel"])
+    sentinel.save(out_path)
+    os.utime(out_path, (time.time() + 60, time.time() + 60))
+
+    # No image_store/labels at all -- if this weren't skipped, run_relations
+    # would raise trying to open them, not just produce the wrong content.
+    run_relations(
+        str(work_dir),
+        str(tmp_path / "image.zarr"),
+        [{"a": "a_labels", "b": "b_labels", "output": "rel.xlsx"}],
+    )
+
+    wb = openpyxl.load_workbook(out_path)
+    assert wb.active["A1"].value == "sentinel"
 
 
 def test_mixed_nuclei_channel_auto_passes_validation():
